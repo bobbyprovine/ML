@@ -21,20 +21,31 @@ At the end, the duals mark a minimum cut and `sum(u_a * y_a)` equals the max flo
 ## Requirements
 
 - Python 3.8+
-- `numpy`
-- `scipy` (1.6 or newer, for the HiGHS solver)
+- `numpy` and `scipy` (1.6 or newer, for the HiGHS solver) -- **always required**
 
 ```
 pip install numpy scipy
 ```
 
-**No Gurobi (or any commercial solver) is needed.** The LP is solved by
-`scipy.optimize.linprog(method="highs")`, and Dijkstra is written by hand with `heapq`.
+The restricted master LP can be solved by any of three back ends. Only the one you
+choose needs to be installed:
+
+| Back end | Install | License |
+|---|---|---|
+| `scipy` (default) | nothing extra | None needed (free HiGHS solver) |
+| `gurobi` | `pip install gurobipy` | The pip install includes a free size-limited license (2,000 variables / 2,000 constraints, non-commercial). Students and staff at academic institutions can get a free full license from Gurobi. |
+| `ampl` | `pip install amplpy` then `python -m amplpy.modules install highs` | Free AMPL Community Edition license (open-source solvers, no size limit). Activate it with `python -m amplpy.modules activate <license-uuid>`. |
+
+Dijkstra (the pricing step) is written by hand with `heapq` in every case.
 
 ## Run it
 
 ```
-python column_generation_maxflow.py
+python column_generation_maxflow.py                    # scipy (default)
+python column_generation_maxflow.py --solver gurobi    # Gurobi
+python column_generation_maxflow.py --solver ampl      # AMPL with HiGHS
+python column_generation_maxflow.py --solver ampl --ampl-solver gurobi
+python column_generation_maxflow.py --solver all       # run all three
 ```
 
 This runs two examples (a 4-node and a 6-node network). For each iteration it prints
@@ -43,17 +54,24 @@ it checks the answer against an ordinary arc-based max flow LP and asserts they 
 
 Expected final results: max flow **5** (4-node) and **19** (6-node).
 
+**Testing status:** the `scipy` back end was run and verified. The `gurobi` and `ampl`
+back ends were written from those libraries' documented APIs but have **not been run**
+(the packages could not be installed where this was written). Every back end checks that
+the dual objective `sum(u_a * y_a)` equals the primal objective and raises an error if it
+does not, so a sign or setting problem will show up as an error rather than a wrong answer.
+If you hit one, please fix the corresponding `_solve_rmp_<name>` function; each is short.
+
 ## How the code maps to the math
 
 | Function | Role |
 |---|---|
-| `solve_rmp(arcs, paths)` | Builds and solves the RMP. Rows = arcs, columns = paths. Returns the objective, path flows `f`, and arc duals `y`. |
+| `solve_rmp(arcs, paths, solver)` | Solves the RMP with the chosen back end (`_solve_rmp_scipy`, `_solve_rmp_gurobi`, `_solve_rmp_ampl`). Rows = arcs, columns = paths. Returns the objective, path flows `f`, and arc duals `y`, after a strong-duality check. |
 | `dijkstra(arcs, length, s, t)` | The pricing problem: shortest path with arc lengths `y_a`. |
 | `bfs_path(arcs, s, t)` | Finds a first path to seed the RMP (the fewest-arc path). |
 | `column_generation(...)` | The main loop: solve RMP, price, add a path, repeat. |
 | `max_flow_arc_lp(...)` | Independent check using the standard arc-flow LP. |
 
-### A note on the duals from scipy
+### Where the duals come from
 
 `linprog` always minimizes, so the code maximizes `sum(f)` by minimizing `-sum(f)`.
 For that minimization, `res.ineqlin.marginals` are `<= 0`, so the code flips the sign:
@@ -61,6 +79,9 @@ For that minimization, `res.ineqlin.marginals` are `<= 0`, so the code flips the
 ```python
 y = -res.ineqlin.marginals     # dual y_a >= 0 of the original max problem
 ```
+
+Gurobi and AMPL model the problem as a maximization directly, so they report the shadow
+price as is: `constr.Pi` in gurobipy and `constraint.dual()` in amplpy.
 
 ## Using your own network
 
@@ -70,7 +91,10 @@ Arcs are a dict of `(from, to): capacity`:
 from column_generation_maxflow import column_generation
 
 arcs = {("s", "a"): 3, ("s", "b"): 2, ("a", "t"): 2, ("b", "t"): 3}
-value, paths, flows, duals = column_generation(arcs, "s", "t")
+value, paths, flows, duals = column_generation(arcs, "s", "t")                  # scipy
+value, paths, flows, duals = column_generation(arcs, "s", "t", solver="gurobi")   # Gurobi
+value, paths, flows, duals = column_generation(arcs, "s", "t", solver="ampl",
+                                                ampl_solver="highs")           # AMPL
 ```
 
 If you leave out `initial_path`, a BFS path is used as the starting column.

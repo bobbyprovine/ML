@@ -81,15 +81,16 @@ def dijkstra(arcs, length, s, t):
 
 
 # ----------------------------------------------------------------------------
-# Restricted master problem (RMP)
+# Restricted master problem (RMP) -- three interchangeable solver back ends
 # ----------------------------------------------------------------------------
-def solve_rmp(arcs, paths):
-    """Solve the RMP over the given paths.
+# Each back end returns (objective, f, y):
+#     f : list/array, flow on each path in `paths`
+#     y : {arc: dual value >= 0}, the shadow price of each arc's capacity
+SOLVERS = ("scipy", "gurobi", "ampl")
 
-    Returns (objective, f, y):
-        f : array, flow on each path in `paths`
-        y : {arc: dual value}, the shadow price of each arc's capacity
-    """
+
+def _solve_rmp_scipy(arcs, paths, **_):
+    """scipy / HiGHS (free, no license needed)."""
     arc_list = list(arcs)
     # A[a, p] = 1 if arc a is on path p, else 0 (one row per arc, one column per path)
     A = np.array([[1.0 if a in p else 0.0 for p in paths] for a in arc_list])
@@ -103,9 +104,89 @@ def solve_rmp(arcs, paths):
 
     # For a minimization, ineqlin.marginals are <= 0; flip the sign to get the
     # dual values y_a >= 0 of the original maximization problem.
-    y_vals = np.clip(-res.ineqlin.marginals, 0.0, None)
-    y = dict(zip(arc_list, y_vals))
-    return -res.fun, res.x, y
+    y = dict(zip(arc_list, np.clip(-res.ineqlin.marginals, 0.0, None)))
+    return -res.fun, list(res.x), y
+
+
+def _solve_rmp_gurobi(arcs, paths, **_):
+    """Gurobi via gurobipy. Needs `pip install gurobipy` and a license
+    (the pip install includes a size-limited one; academic licenses are free)."""
+    try:
+        import gurobipy as gp
+        from gurobipy import GRB
+    except ImportError as e:
+        raise ImportError("gurobipy is not installed: pip install gurobipy") from e
+
+    m = gp.Model("rmp")
+    m.Params.OutputFlag = 0
+    f = m.addVars(len(paths), lb=0.0, name="f")
+    m.setObjective(gp.quicksum(f[i] for i in range(len(paths))), GRB.MAXIMIZE)
+    cons = {}
+    for a, cap in arcs.items():
+        used = gp.quicksum(f[i] for i, p in enumerate(paths) if a in p)
+        cons[a] = m.addConstr(used <= cap, name=f"cap_{a[0]}_{a[1]}")
+    m.optimize()
+    if m.Status != GRB.OPTIMAL:
+        raise RuntimeError(f"Gurobi RMP not optimal (status {m.Status})")
+
+    # Pi = shadow price of the constraint = d(objective)/d(rhs), which is >= 0 here.
+    y = {a: max(cons[a].Pi, 0.0) for a in arcs}
+    return m.ObjVal, [f[i].X for i in range(len(paths))], y
+
+
+def _solve_rmp_ampl(arcs, paths, ampl_solver="highs", **_):
+    """AMPL via amplpy. Needs `pip install amplpy`, a solver module
+    (python -m amplpy.modules install highs) and an AMPL license
+    (the free Community Edition works with open-source solvers)."""
+    try:
+        from amplpy import AMPL
+    except ImportError as e:
+        raise ImportError("amplpy is not installed: pip install amplpy") from e
+
+    ampl = AMPL()
+    ampl.eval(r"""
+        set ARCS;
+        set PATHS;
+        param cap{ARCS} >= 0;
+        param on{ARCS, PATHS} binary default 0;   # 1 if the arc is on the path
+        var f{PATHS} >= 0;
+        maximize Flow: sum{p in PATHS} f[p];
+        s.t. Cap{a in ARCS}: sum{p in PATHS} on[a, p] * f[p] <= cap[a];
+    """)
+    labels = {a: f"{a[0]}_{a[1]}" for a in arcs}              # AMPL set members
+    ampl.set["ARCS"] = list(labels.values())
+    ampl.set["PATHS"] = list(range(len(paths)))
+    ampl.param["cap"] = {labels[a]: float(c) for a, c in arcs.items()}
+    ampl.param["on"] = {(labels[a], i): 1 for i, p in enumerate(paths) for a in p}
+    ampl.option["solver"] = ampl_solver
+    ampl.solve()
+
+    obj = ampl.obj["Flow"].value()
+    f = [ampl.var["f"][i].value() for i in range(len(paths))]
+    # AMPL's dual of a <= constraint in a max problem is >= 0 (d objective / d rhs).
+    y = {a: max(ampl.con["Cap"][labels[a]].dual(), 0.0) for a in arcs}
+    return obj, f, y
+
+
+def solve_rmp(arcs, paths, solver="scipy", **options):
+    """Solve the RMP over `paths` with the chosen back end.
+
+    Returns (objective, f, y). The duals are checked against the objective
+    (strong duality: sum(u_a * y_a) must equal the objective), which catches
+    any sign-convention or solver-setting mistakes in a back end.
+    """
+    backends = {"scipy": _solve_rmp_scipy,
+                "gurobi": _solve_rmp_gurobi,
+                "ampl": _solve_rmp_ampl}
+    if solver not in backends:
+        raise ValueError(f"solver must be one of {SOLVERS}")
+    obj, f, y = backends[solver](arcs, paths, **options)
+
+    dual_obj = sum(arcs[a] * y[a] for a in arcs)
+    if abs(dual_obj - obj) > 1e-6 * max(1.0, abs(obj)):
+        raise RuntimeError(f"[{solver}] dual objective {dual_obj} != primal {obj}; "
+                           "check the dual sign convention / solver settings.")
+    return obj, f, y
 
 
 # ----------------------------------------------------------------------------
@@ -115,14 +196,19 @@ def fmt_path(path):
     return "-".join([path[0][0]] + [v for (_, v) in path])
 
 
-def column_generation(arcs, s, t, initial_path=None, tol=1e-9, verbose=True):
-    """Max flow by column generation. Returns (max_flow, paths, f, y)."""
+def column_generation(arcs, s, t, initial_path=None, tol=1e-9, verbose=True,
+                      solver="scipy", **solver_options):
+    """Max flow by column generation. Returns (max_flow, paths, f, y).
+
+    solver: "scipy" (default), "gurobi" or "ampl" -- which LP back end solves the RMP.
+    solver_options: passed to the back end, e.g. ampl_solver="highs".
+    """
     paths = [initial_path if initial_path is not None else bfs_path(arcs, s, t)]
 
     it = 0
     while True:
         it += 1
-        obj, f, y = solve_rmp(arcs, paths)
+        obj, f, y = solve_rmp(arcs, paths, solver, **solver_options)
 
         # Pricing: shortest s-t path with the duals as arc lengths.
         cost, new_path = dijkstra(arcs, y, s, t)
@@ -190,11 +276,12 @@ ARCS_6 = {("s", "a"): 10, ("s", "b"): 10, ("a", "b"): 2, ("a", "c"): 4, ("a", "d
           ("b", "d"): 9, ("d", "c"): 6, ("c", "t"): 10, ("d", "t"): 10}
 
 
-def run_example(name, arcs, s, t, initial_path=None):
+def run_example(name, arcs, s, t, initial_path=None, solver="scipy", **solver_options):
     print("=" * 70)
-    print(name)
+    print(f"{name}   [RMP solver: {solver}]")
     print("=" * 70)
-    value, paths, f, y = column_generation(arcs, s, t, initial_path=initial_path)
+    value, paths, f, y = column_generation(arcs, s, t, initial_path=initial_path,
+                                           solver=solver, **solver_options)
     check = max_flow_arc_lp(arcs, s, t)
 
     print(f"Column generation max flow : {value:.4f}")
@@ -208,9 +295,22 @@ def run_example(name, arcs, s, t, initial_path=None):
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Column generation for max flow")
+    parser.add_argument("--solver", choices=SOLVERS + ("all",), default="scipy",
+                        help="LP solver for the restricted master problem")
+    parser.add_argument("--ampl-solver", default="highs",
+                        help="solver AMPL should call (e.g. highs, cbc, gurobi)")
+    args = parser.parse_args()
+    chosen = SOLVERS if args.solver == "all" else (args.solver,)
+
     # The starting paths below match the documents; leave initial_path out
     # to seed with a BFS path instead.
-    run_example("4-node example", ARCS_4, "s", "t",
-                initial_path=[("s", "a"), ("a", "t")])
-    run_example("6-node example", ARCS_6, "s", "t",
-                initial_path=[("s", "a"), ("a", "c"), ("c", "t")])
+    for solver in chosen:
+        run_example("4-node example", ARCS_4, "s", "t",
+                    initial_path=[("s", "a"), ("a", "t")],
+                    solver=solver, ampl_solver=args.ampl_solver)
+        run_example("6-node example", ARCS_6, "s", "t",
+                    initial_path=[("s", "a"), ("a", "c"), ("c", "t")],
+                    solver=solver, ampl_solver=args.ampl_solver)
