@@ -1,0 +1,68 @@
+\documentclass[10pt]{article}
+\usepackage[margin=0.7in]{geometry}
+\usepackage{booktabs,array,xcolor}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\setlength{\parindent}{0pt}\setlength{\parskip}{5pt}
+\renewcommand{\arraystretch}{1.25}
+\newcommand{\code}[1]{\texttt{\small #1}}
+\pagestyle{empty}
+
+\begin{document}
+{\Large\bfseries AMPL vs.\ amplpy Cheat Sheet}\\[-2pt]
+\rule{\linewidth}{0.6pt}
+
+\textbf{Key idea.} Everything inside \code{ampl.eval(r"""...""")} is \emph{ordinary AMPL}, exactly what you would type at the \code{ampl:} prompt or save in a \code{.mod} file. The \code{r"""..."""} wrapper is plain Python (a raw, multi-line string). amplpy adds Python calls for loading data, solving and reading results.
+
+\textbf{Setup (once).}\\
+\code{pip install amplpy}\\
+\code{python -m amplpy.modules install highs}\\
+\code{python -m amplpy.modules activate <license-uuid>}\quad(free Community Edition)
+
+\medskip
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{1.3in}>{\raggedright\arraybackslash}p{2.3in}>{\raggedright\arraybackslash}p{3.2in}@{}}
+\toprule
+\textbf{Task} & \textbf{Plain AMPL} & \textbf{amplpy (Python)} \\
+\midrule
+Declare the model & \code{.mod} file or typed at prompt & \code{ampl.eval(r"""...""")} or \code{ampl.read("model.mod")} \\
+Load a set & \code{data; set S := a b c;} & \code{ampl.set["S"] = ["a","b","c"]} \\
+Load a parameter & \code{param cap := a 4 b 12;} & \code{ampl.param["cap"] = \{"a": 4, "b": 12\}} \\
+Load a data file & \code{data file.dat;} & \code{ampl.read\_data("file.dat")} \\
+Choose solver & \code{option solver highs;} & \code{ampl.option["solver"] = "highs"} \\
+Solve & \code{solve;} & \code{ampl.solve()} \\
+Variable value & \code{display x;} & \code{ampl.var["x"].value()}\quad indexed: \code{ampl.var["x"]["a"].value()} \\
+Objective value & \code{display Profit;} & \code{ampl.obj["Profit"].value()} \\
+Constraint dual & \code{display Plant1.dual;} & \code{ampl.con["Plant1"].dual()}\quad indexed: \code{ampl.con["C"]["a"].dual()} \\
+Constraint slack & \code{display Plant1.slack;} & \code{ampl.con["Plant1"].slack()} \\
+Run any command & type it at the prompt & \code{ampl.eval("display x;")} \\
+Clear the model & \code{reset;} & \code{ampl.reset()} \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\textbf{Minimal skeleton.}
+
+\begin{tabular}{@{}p{6.9in}@{}}
+\code{from amplpy import AMPL}\\
+\code{ampl = AMPL()}\\
+\code{ampl.eval(r"""}\\
+\code{\ \ \ \ var x1 >= 0;  var x2 >= 0;}\\
+\code{\ \ \ \ maximize Profit: 3*x1 + 5*x2;}\\
+\code{\ \ \ \ subject to Plant1: x1 <= 4;}\\
+\code{\ \ \ \ subject to Plant2: 2*x2 <= 12;}\\
+\code{\ \ \ \ subject to Plant3: 3*x1 + 2*x2 <= 18;}\\
+\code{""")}\\
+\code{ampl.option["solver"] = "highs"}\\
+\code{ampl.solve()}\\
+\code{print(ampl.obj["Profit"].value(), ampl.var["x1"].value(), ampl.con["Plant2"].dual())}
+\end{tabular}
+
+\medskip
+\textbf{Notes.}
+\begin{itemize}\setlength{\itemsep}{1pt}
+\item Existing \code{.mod} and \code{.dat} files work unchanged: load them with \code{ampl.read(...)} and \code{ampl.read\_data(...)}.
+\item You can still put a \code{data;} block inside \code{ampl.eval}; the Python data calls are just a convenience.
+\item Output from \code{display} goes to Python's output instead of a terminal.
+\item Wyndor check: optimum $x_1=2,\ x_2=6$, profit $36$, duals $0,\ 1.5,\ 1$.
+\end{itemize}
+\end{document}
