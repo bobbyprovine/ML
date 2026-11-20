@@ -1,0 +1,7 @@
+numpy>=1.26
+scipy>=1.11        # scipy.optimize.milp needs >= 1.9
+matplotlib>=3.7
+networkx>=3.0
+jupyterlab
+# optional, for notebook 11 (requires a Gurobi license):
+# gurobipy
